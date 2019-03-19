@@ -1,0 +1,13 @@
+pandas
+matplotlib
+requests
+scikit-learn
+scikit-surprise
+scipy
+torch
+torchvision
+torch-scatter
+torch-sparse
+torch-cluster
+torch-geometric
+
