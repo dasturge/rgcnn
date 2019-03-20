@@ -1,6 +1,7 @@
 import os
 
 import pandas as pd
+import pickle
 import matplotlib.pyplot as plt
 import numpy as np
 import requests
@@ -15,16 +16,16 @@ import torch_scatter as tsct
 import torch_geometric.nn as gnn
 import torch_geometric
 
-from surprise import Dataset, KNNBasic
-from surprise.model_selection import KFold
+from surprise import Dataset, KNNBasic, Reader
+from surprise.model_selection import KFold, train_test_split
 
 torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
 
 class RGCNNFactorization(nn.Module):
 
-    def __init__(self, input_shape, factorization_rank=10, n_channels=32,
-                 basis_order=5, diffusion_time=10, hidden_cells=32,
+    def __init__(self, input_shape, factorization_rank=10, n_channels=256,
+                 basis_order=5, diffusion_time=15, hidden_cells=256,
                  lstm_layers=1, bidirectional=False):
         super().__init__()
 
@@ -82,19 +83,24 @@ class RGCNNFactorization(nn.Module):
 
         return Hout, Wout
 
-    def train(self, H, W, HA, WA, Y, iters, optimizer=None, test=[]):
+    def train(self, H, W, HA, WA, Y,  Xorig, Test, iters, optimizer=None):
         if optimizer is None:
-            optimizer = optim.Adam(self.parameters())
+            optimizer = optim.Adam(self.parameters(), lr=1e-4)
 
         loss_history = np.zeros((iters,))
+        error_history = np.zeros((iters,))
 
-        ymask = sps.coo_matrix((np.ones_like(Y.data), (Y.row, Y.col)))
-        ymask = tensor_from_scipy_sparse(ymask).cuda()
+        testmask = sps.coo_matrix((np.ones_like(Test.data), (Test.row, Test.col)))
+        testmask.resize(Xorig.shape)
+        testmask = tensor_from_scipy_sparse(testmask).cuda()
+        Test = tensor_from_scipy_sparse(Test).cuda()
 
         maximum = np.max(Y)
         minimum = np.min(Y)
-
-        Y = tensor_from_scipy_sparse(Y).cuda()
+        M = sps.coo_matrix(Y + Xorig)
+        allmask = tensor_from_scipy_sparse(sps.coo_matrix((np.ones_like(M.data), (M.row, M.col)))).cuda()
+        # Y = tensor_from_scipy_sparse(Y).cuda()
+        M = tensor_from_scipy_sparse(M).cuda()
 
         Lh = sps.csgraph.laplacian(HA)
         Lw = sps.csgraph.laplacian(WA)
@@ -107,24 +113,35 @@ class RGCNNFactorization(nn.Module):
         WA = torch.tensor([WA.row, WA.col]).long().cuda()
 
         for i in range(iters):
-            optimizer.zero_grad()
+
             Hout, Wout = self.forward(H, W, HA, WA)
-            loss = self.loss_fn((Hout, Wout), (Lh, Lw), Y, ymask, (minimum, maximum))
+            loss = self.loss_fn((Hout, Wout), (Lh, Lw), M, allmask, (minimum, maximum))
             loss.backward()
             optimizer.step()
+            optimizer.zero_grad()
             loss_history[i] = loss.item()
-            Xpred = torch.mm(Hout, torch.transpose(Wout, 0, 1))
-            Xpred = minimum + (maximum - 1) * (Xpred - torch.min(Xpred)) / (torch.max(Xpred) - torch.min(Xpred))
-            print('iter %s: loss: %s, error: %s' % (i, loss_history[i], self.predict(Xpred, Y, ymask)))
+            Xpred = combine(Hout, Wout)
+            error_history[i] = self.predict(Xpred, Test, testmask)
+            print('iter %s: loss: %s, error: %s' % (i, loss_history[i], error_history[i]))
 
-        return Hout, Wout, loss_history
+        return Hout.cpu().detach(), Wout.cpu().detach(), loss_history, error_history
 
-    def predict(self, X, Y, Mask, norm=False):
+    def predict(self, X, Y, Mask=None, norm=False):
         if norm:
             X = 1 + 4 * (X - torch.min(X)) / (torch.max(X) - torch.min(X))
+        if Mask is None:
+            Mask = sps.coo_matrix((np.ones_like(Y.data), (Y.row, Y.col)), shape=Y.shape)
+            Mask = tensor_from_scipy_sparse(Mask)
+            Y = tensor_from_scipy_sparse(Y)
         predictions = X * Mask.to_dense()
-        predictions_error = frobenius_norm(predictions - Y)
-        return predictions_error
+        predictions_error = torch.sum(torch.abs(predictions - Y)) / torch.sum(Mask.to_dense())
+        return predictions_error.item()
+
+
+def combine(H, W, minimum=1, maximum=5):
+    Xpred = torch.mm(H, torch.transpose(W, 0, 1))
+    Xpred = minimum + (maximum - 1) * (Xpred - torch.min(Xpred)) / (torch.max(Xpred) - torch.min(Xpred))
+    return Xpred
 
 
 # for computation of loss
@@ -152,6 +169,7 @@ def recommender_loss(inputs, laplacians, target, mask, extrema, gamma=1e-10):
     # consider only original data and test data, ignore other sparse values.
     xm = mask.to_dense() * (X_normed - target)
     fnorm = frobenius_norm(xm)
+    fnorm = fnorm / torch.sum(mask.to_dense())
 
     # compute regularization
     gH = graph_norm(H, Lh)
@@ -193,29 +211,71 @@ if __name__ == '__main__':
                               'Sci-Fi', 'Thriller', 'War', 'Western']]
     # WA = nbrs.kneighbors_graph(features, n_neighbors=10)
 
-    kf = KFold(n_splits=5)
-    movielens = Dataset.load_builtin('ml-100k')
-    train, test = next(kf.split(movielens))
+    #kf = KFold(n_splits=5)
+    #movielens = Dataset.load_builtin('ml-100k')
+    #train, test = next(kf.split(movielens))
+    train_df = pd.read_csv('ua.base', sep="\t", names=['uid', 'iid', 'rating', 'time'])
+    test_df = pd.read_csv('ua.test', sep='\t', names=['uid', 'iid', 'rating', 'time'])
+
+    fields = ['uid', 'iid', 'rating']
+    reader = Reader(rating_scale=(1, 5))
+    train_set = Dataset.load_from_df(df=train_df[fields], reader=reader)
+    test = Dataset.load_from_df(df=test_df[fields], reader=reader).build_full_trainset()
+    np.random.seed(0)
+    train, validate = train_test_split(train_set, test_size=0.2)
 
     i, j, data = zip(*train.all_ratings())
+    print(len(data))
     X = sps.coo_matrix((data, (i, j)))
-    i, j, data = zip(*test)
-    i = [int(ia) for ia in i]
-    j = [int(ja) for ja in j]
+    i, j, data = zip(*validate)
+    i = [int(ia - 1) for ia in i]
+    j = [int(ja - 1) for ja in j]
     Y = sps.coo_matrix((data, (i, j)))
+    X.resize(Y.shape)
 
-    X = sps.coo_matrix((data, (i, j)))
-    HA = nbrs.kneighbors_graph(X, n_neighbors=10)
-    WA = nbrs.kneighbors_graph(X.T, n_neighbors=10)
+    i, j, data = zip(*test.all_ratings())
+    Test = sps.coo_matrix((data, (i, j)))
+    Test.resize(X.shape)
 
-    U, Sigma, V = sps.linalg.svds(X, k=10)
+    HA = nbrs.kneighbors_graph(X, n_neighbors=20)
+    WA = nbrs.kneighbors_graph(X.T, n_neighbors=20)
+
+    k = 30
+    U, Sigma, V = sps.linalg.svds(X, k=k)
     H = U * Sigma
     W = V.T * Sigma
     HA = sps.coo_matrix(HA)
     WA = sps.coo_matrix(WA)
-    Xtest = X.copy()
-    Xtest.resize(Y.shape)
-    M = sps.coo_matrix(Xtest + Y)
+    Xorig = X.copy()
+    Xorig.resize(Y.shape)
+    #M = sps.coo_matrix(Xtest + Y)
+    torch.initial_seed()
+    model = RGCNNFactorization(X.shape, factorization_rank=k)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    fig = plt.figure()
+    modelN = 8000
+    from glob import glob
+    # model_path = glob('models/model%s_*.pickle' % modelN)[0]
+    # model.load_state_dict(torch.load(model_path))
+    epochs = 100
+    for i in range(modelN // epochs, 10000000):
+        Hout, Wout, loss_history, history = model.train(H, W, HA, WA, Y, Xorig, Test, epochs, optimizer=optimizer)
+        torch.save(model.state_dict(), 'models2/model%s_%.4f.pickle' % (epochs * (i + 1), history[-1]))
+        X = combine(Hout, Wout)
+        plt.imshow(X, cmap='hot', vmin=1, vmax=5)
+        plt.show()
+        plt.savefig('figs/plot%s_%.4f.png' % (epochs * (i + 1), history[-1]))
 
-    model = RGCNNFactorization(X.shape)
-    model.train(H, W, HA, WA, M, 10000)
+    X = combine(Hout, Wout)
+    plt.subplot(1, 2, 1)
+    plt.imshow(X, cmap='hot', vmin=1, vmax=5)
+    plt.subplot(1, 2, 2)
+
+    X.numpy()
+    with open('X.pickle', 'wb') as fd:
+        pickle.dump(X, fd, pickle.HIGHEST_PROTOCOL)
+
+    # combine X, Test with forward pass and dump data...
+    error = model.predict(X, Test)
+    print(error)
+
