@@ -24,8 +24,8 @@ torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
 class RGCNNFactorization(nn.Module):
 
-    def __init__(self, input_shape, factorization_rank=10, n_channels=256,
-                 basis_order=5, diffusion_time=15, hidden_cells=256,
+    def __init__(self, input_shape, factorization_rank=10, n_channels=32,
+                 basis_order=5, diffusion_time=10, hidden_cells=32,
                  lstm_layers=1, bidirectional=False):
         super().__init__()
 
@@ -66,20 +66,22 @@ class RGCNNFactorization(nn.Module):
 
     def forward(self, H, W, HA, WA):
         hidden = self.init_hidden()
+        Hout = H
+        Wout = W
         for i in range(self.T):
-            conv1 = self.hconv(H, HA)
+            conv1 = self.hconv(Hout, HA)
             Htilde = torch.sigmoid(conv1)
             out, hidden = self.lstm(Htilde.unsqueeze(0), hidden)
             dout = self.dense_H(out)
             dH = torch.tanh(dout).squeeze()
-            Hout = H + dH
+            Hout = Hout + dH
 
-            conv2 = self.wconv(W, WA)
+            conv2 = self.wconv(Wout, WA)
             Wtilde = torch.sigmoid(conv2)
             out, hidden = self.lstm(Wtilde.unsqueeze(0), hidden)
             dout = self.dense_W(out)
             dW = torch.tanh(dout).squeeze()
-            Wout = W + dW
+            Wout = Wout + dW
 
         return Hout, Wout
 
@@ -140,7 +142,7 @@ class RGCNNFactorization(nn.Module):
 
 def combine(H, W, minimum=1, maximum=5):
     Xpred = torch.mm(H, torch.transpose(W, 0, 1))
-    Xpred = minimum + (maximum - 1) * (Xpred - torch.min(Xpred)) / (torch.max(Xpred) - torch.min(Xpred))
+    Xpred = minimum + (maximum - 1) * (Xpred - torch.min(Xpred)) / (torch.max(Xpred - torch.min(Xpred)))
     return Xpred
 
 
@@ -163,8 +165,7 @@ def recommender_loss(inputs, laplacians, target, mask, extrema, gamma=1e-10):
     Lh, Lw = laplacians
 
     # set X to valid ratings
-    X = torch.mm(H, torch.transpose(W, 0, 1))
-    X_normed = extrema[0] + (extrema[1] - 1) * (X - torch.min(X)) / (torch.max(X) - torch.min(X))
+    X_normed = combine(H, W)
 
     # consider only original data and test data, ignore other sparse values.
     xm = mask.to_dense() * (X_normed - target)
@@ -237,10 +238,10 @@ if __name__ == '__main__':
     Test = sps.coo_matrix((data, (i, j)))
     Test.resize(X.shape)
 
-    HA = nbrs.kneighbors_graph(X, n_neighbors=20)
-    WA = nbrs.kneighbors_graph(X.T, n_neighbors=20)
+    HA = nbrs.kneighbors_graph(X, n_neighbors=10)
+    WA = nbrs.kneighbors_graph(X.T, n_neighbors=10)
 
-    k = 30
+    k = 10
     U, Sigma, V = sps.linalg.svds(X, k=k)
     H = U * Sigma
     W = V.T * Sigma
@@ -253,18 +254,31 @@ if __name__ == '__main__':
     model = RGCNNFactorization(X.shape, factorization_rank=k)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     fig = plt.figure()
-    modelN = 8000
+    #modelN = 8000
     from glob import glob
     # model_path = glob('models/model%s_*.pickle' % modelN)[0]
     # model.load_state_dict(torch.load(model_path))
-    epochs = 100
-    for i in range(modelN // epochs, 10000000):
-        Hout, Wout, loss_history, history = model.train(H, W, HA, WA, Y, Xorig, Test, epochs, optimizer=optimizer)
-        torch.save(model.state_dict(), 'models2/model%s_%.4f.pickle' % (epochs * (i + 1), history[-1]))
+    epochs = 10
+    loss_history = []
+    error_history = []
+    for i in range(30):
+        Hout, Wout, lhistory, ehistory = model.train(H, W, HA, WA, Y, Xorig, Test, epochs, optimizer=optimizer)
+        loss_history += lhistory.tolist()
+        error_history += ehistory.tolist()
+        torch.save(model.state_dict(), 'models2/model%s_%.4f.pickle' % (epochs * (i + 1), ehistory[-1]))
         X = combine(Hout, Wout)
         plt.imshow(X, cmap='hot', vmin=1, vmax=5)
-        plt.show()
-        plt.savefig('figs/plot%s_%.4f.png' % (epochs * (i + 1), history[-1]))
+        plt.savefig('figs2/plot%s_%.4f.png' % (epochs * (i + 1), ehistory[-1]))
+    plt.subplot(1, 2, 1)
+    plt.plot([10 * i for i in range(len(loss_history))], loss_history)
+    plt.ylabel('loss')
+    plt.xlabel('iter')
+    plt.subplot(1, 2, 2)
+    plt.plot([10 * i for i in range(len(error_history))], error_history)
+    plt.ylabel('MAE')
+    plt.xlabel('iter')
+    plt.show()
+    print(loss_history)
 
     X = combine(Hout, Wout)
     plt.subplot(1, 2, 1)
